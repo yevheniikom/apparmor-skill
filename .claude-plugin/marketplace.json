@@ -1,0 +1,26 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "apparmor-skill",
+  "description": "AppArmor skill for Claude Code — create, audit, and troubleshoot AppArmor profiles on Linux",
+  "owner": {
+    "name": "yevheniikom"
+  },
+  "metadata": {
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "apparmor",
+      "description": "Create, edit, audit, and troubleshoot AppArmor profiles on Linux -- the mandatory access control (MAC) system that confines programs via path-based policies. Trigger on AppArmor, mandatory access control, confining or hardening an app/service, profile rules (file, network, capability, signal, dbus, mount), abstractions, tunables, denial-log analysis, the aa-* tools (aa-genprof, aa-logprof, aa-complain, aa-enforce, aa-status), or apparmor_parser. ALSO trigger for confining or auditing Docker/container/Kubernetes workloads, the docker-default profile, --security-opt apparmor, or container escapes. ALSO trigger for Electron/Chromium apps that fail to launch on Ubuntu 24.04+ with chrome-sandbox, SUID sandbox, userns, or namespace-sandbox errors, or any mention of kernel.apparmor_restrict_unprivileged_userns -- prefer triggering over not.",
+      "category": "security",
+      "author": {
+        "name": "yevheniikom"
+      },
+      "source": "./",
+      "skills": [
+        "./skills/apparmor"
+      ],
+      "homepage": "https://github.com/yevheniikom/apparmor-skill"
+    }
+  ]
+}
