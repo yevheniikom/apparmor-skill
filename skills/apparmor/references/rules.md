@@ -1,6 +1,18 @@
 # AppArmor Rule Syntax Reference
 
-Complete syntax reference for all AppArmor rule types: profile structure, file permissions, glob patterns, network, capability, signal, DBus, and mount rules.
+Syntax reference for the everyday AppArmor rule types: profile structure, file permissions, glob patterns, network, capability, signal, DBus, and mount rules. Advanced/4.0+ primitives (userns, io_uring, fine-grained AF_UNIX, xattr attachment, message queues) live in `rules-advanced.md` — see the pointer at the end.
+
+## Contents
+
+1. [Profile Structure](#1-profile-structure) — preamble, header, flags, `priority=`, `flags=(unconfined)`, `attach_disconnected`/`@{att}`
+2. [File Permissions](#2-file-permissions) — access modes, exec transitions (`ix`/`Px`/`Cx`/…), fallbacks, the `owner` conditional, the `link ->` rule for hard links
+3. [Glob Patterns (AARE)](#3-glob-patterns-aare) — `*` vs `**`, the `/usr/lib/*/*` flat-helper trap, quoted-path brace limits
+4. [Network Rules](#4-network-rules) — domains/types/protocols; the "never blanket-`deny network,` in a GUI profile" trap
+5. [Capability Rules](#5-capability-rules) — capability list, modern `bpf`/`perfmon`/`checkpoint_restore` split-outs
+6. [Signal Rules](#6-signal-rules) — `send`/`receive`, signal sets, peers
+7. [DBus Rules](#7-dbus-rules) — bus/path/interface/member/peer conditionals
+8. [Mount Rules](#8-mount-rules) — `mount`/`remount`/`umount`/`pivot_root`, fstype/options conditions
+9. **[Advanced / 4.0+ primitives](#advanced--40-rule-primitives)** → pointer to `rules-advanced.md` (userns, io_uring, unix, xattr, mqueue)
 
 ---
 
@@ -92,6 +104,8 @@ The one rule that *does* take effect is `userns,` — which is exactly why every
 
 **Architectural consequence:** you cannot build a "trampoline with denies" out of an unconfined profile — granting userns freedom via `unconfined` simultaneously discards all rule mediation. If a profile must allow `userns,` *and* enforce policy, the policy has to live in a different profile that the userspace tool transitions into, or rely on the tool's own sandbox primitives (bwrap `--ro-bind`, seccomp, landlock). Verify which label is actually in effect with `cat /proc/self/attr/current` under `aa-exec --profile=<name>` — if a known-denied path is readable, no confinement is happening (see workflow.md §4).
 
+> **Version trap:** on `apparmor_parser` 4.0.0/4.0.1, adding *any* body rule to a `flags=(unconfined)` profile (including via `include if exists <local/...>`) silently demotes it to `enforce`. Before shipping a `local/` deny include for an unconfined stub profile, see `parser-bugs/4.0.0-4.0.1-unconfined-mediation.md`.
+
 ### Confining namespace-creating tools: `attach_disconnected` and `@{att}`
 
 When a confined process creates a new mount namespace (bwrap, podman, runc, crun, unshare wrappers) and accesses files inside it, the kernel may resolve those paths in a context "disconnected" from the host filesystem root the profile rules were written against — so the normal rules don't match.
@@ -130,7 +144,7 @@ File rules grant or deny specific access modes on path patterns.
 | `a` | Append | Conflicts with `w`; write-only at EOF |
 | `m` | Memory-map with `PROT_EXEC` | Required for shared libraries |
 | `k` | File locking (`flock`, `fcntl`) | |
-| `l` | Hard link creation | Requires both `l` on the link name and the target's permissions |
+| `l` | Hard link creation | Requires both `l` on the link name and the target's permissions — **and** an explicit `link` rule (below) |
 
 ### Execute transition modes
 
@@ -169,11 +183,43 @@ Direct an exec to a specific profile name with `->`:
 
 ### Owner conditional
 
-Restrict the rule to files owned by the process UID:
+Restrict the rule to files whose owner matches the process **fsuid**:
 
 ```
 owner /home/*/.ssh/** r,
 ```
+
+**Don't reach for `owner` by default — it is a narrowing qualifier that costs more than it protects.**
+
+- **It breaks legitimate cross-uid reads.** A user picks files in their file manager and hands them to a converter/viewer/archiver; those files may be owned by another uid (removable media formatted elsewhere, an NFS/SMB share, root-owned scans, a colleague's export on a shared mount). DAC already permitted the read; `owner` then denies it anyway, silently. So for **user-selected content and shared locations** (`@{HOME}/**` documents, `/mnt`, `/media`, `/run/media`, `/srv`), leave `owner` off.
+- **`owner` + `deny` is a bug.** `deny owner @{HOME}/x` blocks only when the caller owns the file — a copy owned by someone else slips past. A security deny must be unconditional: `deny @{HOME}/x`.
+- **It muddies diagnosis under `sudo aa-exec`.** That runs as euid 0, so every `owner @{HOME}` rule stops matching and the profile looks broken when it isn't (see workflow.md — validate `owner`-gated access from the real caller at the real uid, not root).
+
+**Where `owner` does belong:** genuinely per-process / per-user private state where a cross-uid match would itself be the anomaly — `owner @{PROC}/@{pid}/**`, `owner /run/user/[0-9]*/**`, `owner @{HOME}/.config/**` / `.cache/**` / `.Xauthority`. Add it only when you can name the cross-uid access it stops, and never silently — leave a comment saying which read it blocks, or a later session will trip over it during `aa-exec` testing.
+
+### Hard links need an explicit `link` rule — the `l` mode alone is not enough
+
+Creating a hard link is mediated as its own operation, with a dedicated rule form:
+
+```
+[audit] [deny] link [subset] PATH -> TARGET,
+```
+
+Two things must both be present for `link(oldpath, newpath)` (or `linkat`) to succeed under a profile:
+
+1. The `l` **mode** on the relevant file rules — on the **new** link name, and read/write as appropriate on the target. `l` in a plain file rule authorizes *link* as an access mode.
+2. An explicit **`link` rule** naming source and target: `link /path/new -> /path/target,`. Without it, the create is denied even when both paths carry `l`.
+
+The `subset` keyword restricts the new link so it cannot grant more access than the target already has (the safe default for most link rules).
+
+This bites whenever a program creates a file by linking a temporary name onto the final path rather than writing it directly — atomic-save editors (`write tmp; link/rename onto target`), lockfile creators, and Unix-socket mux servers (`muxserver_listen()` does `link(tmpname, socketpath)`). The temp name usually has a random suffix, so it needs a glob, and it is mediated **separately** from the visible target:
+
+```apparmor
+owner @{HOME}/.ssh/sockets/**   rwkl,               # k: ssh flocks the socket; l: link mode
+link  @{HOME}/.ssh/sockets/** -> @{HOME}/.ssh/sockets/**,
+```
+
+Symptom of the missing `link` rule: the operation fails even though `rw`/`k` on the path look correct, and (if the path is reached via a symlink onto a mount) the rule may also be matching the wrong resolved string — see §3 and hardening.md pitfall 11.
 
 ### Examples
 
@@ -305,6 +351,23 @@ network netlink raw,              # Netlink raw sockets
 network unix stream,              # Unix stream sockets
 deny network raw,                 # Block raw sockets
 ```
+
+### Never blanket-`deny network,` in a GUI profile — it kills the display
+
+GUI toolkits reach the display server and session bus over **AF_UNIX** (`/run/user/<uid>/wayland-0`, the X socket, the dbus socket). A blanket `deny network,` can sweep AF_UNIX in with it: on kernels without fine-grained af_unix mediation, `unix` rules downgrade to `network unix` and the deny catches them. Since `deny` beats `allow` at equal priority, it overrides the AF_UNIX access that `abstractions/base` + `wayland`/`X` + the dbus abstraction granted — the app then fails with `Failed to create wl_display (Permission denied)` / `could not connect to display` and, tellingly, **zero file denials** (a network-family implicit deny logs as `operation="create"`, not `"open"`).
+
+Whether a bare `deny network,` actually clobbers AF_UNIX is kernel-dependent, but the guidance holds regardless: **allow AF_UNIX explicitly and deny only the real families.**
+
+```
+network unix,
+deny network inet,
+deny network inet6,
+deny network raw,
+deny network packet,
+deny network netlink,
+```
+
+A non-GUI CLI worker has no display socket, so a plain `deny network,` is fine there — the trap is specifically GUI + blanket network-deny.
 
 ---
 
@@ -490,138 +553,8 @@ deny mount options=(suid,dev),                       # Block suid/dev mounts
 
 ---
 
-## 9. User Namespace Rules (AppArmor 4.0+)
+## Advanced / 4.0+ rule primitives
 
-User namespace creation is mediated by the `userns` rule. This is the rule Ubuntu 23.10+ uses to enforce `kernel.apparmor_restrict_unprivileged_userns=1` — unconfined programs can't call `unshare(CLONE_NEWUSER)` unless their profile explicitly allows it.
+The rules above (§1–§8) cover everything an everyday profile needs. AppArmor also mediates a set of advanced primitives that most profiles never touch — **user namespaces** (`userns`), **io_uring**, **fine-grained AF_UNIX sockets** (the standalone `unix` rule), **profile attachment by xattr**, and **message queues** (`mqueue`). These live in a separate file so a routine profile-writing cycle doesn't have to load them:
 
-```apparmor
-[audit] [deny] userns [ACCESS],
-```
-
-The only access keyword is `create`. Standalone `userns,` grants all current (and any future) userns permissions.
-
-### Examples
-
-```apparmor
-userns,                 # Allow creating user namespaces (all permissions)
-userns create,          # Explicit "create" permission — equivalent today
-deny userns,            # Block userns creation
-```
-
-`userns,` is **per-profile and not inherited** across exec transitions. A parent that can create namespaces will still have its child denied unless the child profile also has `userns,` — this is the #1 cause of "Electron tabs crash but the app launches" bugs. See `electron-chromium.md`.
-
----
-
-## 10. io_uring Rules (AppArmor 4.0+)
-
-`io_uring` rules mediate io_uring submission and credential overrides.
-
-```apparmor
-[audit] [deny] io_uring [ACCESS] [label=TARGET],
-```
-
-Access keywords:
-
-| Keyword | Meaning |
-|---------|---------|
-| `sqpoll` | Allow creating io_uring instances with the SQPOLL (kernel poller thread) feature |
-| `override_creds` | Allow io_uring operations to run under different credentials (`IORING_REGISTER_PERSONALITY` / `IOSQE_FIXED_FILE`) |
-
-### Examples
-
-```apparmor
-io_uring,                                         # All io_uring permissions
-io_uring sqpoll,                                  # Allow kernel poller thread
-io_uring override_creds label="worker_profile",   # Restrict credential override target
-deny io_uring,                                    # Block io_uring entirely
-```
-
-Rule of thumb: if the app doesn't use io_uring intentionally, a `deny io_uring,` is cheap defense-in-depth — io_uring has been the source of several 2023–2025 CVEs (escape from seccomp filters, memory corruption).
-
----
-
-## 11. Fine-Grained Unix Socket Rules (AppArmor 3.x+)
-
-The coarse `network unix,` rule allows *any* AF_UNIX access. For tighter control, use the standalone `unix` rule, which mediates by address, peer label, and operation.
-
-```apparmor
-[audit] [deny] unix [ACCESS] [RULE-CONDS] [LOCAL-EXPR] [PEER-EXPR],
-```
-
-Access keywords: `create`, `bind`, `listen`, `accept`, `connect`, `shutdown`, `getattr`, `setattr`, `getopt`, `setopt`, `send`, `receive` (aliases: `r`/`w` for receive/send).
-
-Conditions:
-
-| Condition | Example | Meaning |
-|-----------|---------|---------|
-| `type=` | `type=stream` | Socket type (`stream`, `dgram`, `seqpacket`) |
-| `protocol=` | `protocol=0` | Socket protocol |
-| `addr=` | `addr="@/my-app/*"` | Abstract or filesystem socket path (abstract sockets use `@` prefix; `addr=none` matches unnamed sockets) |
-| `peer=(label=...)` | `peer=(label=unconfined)` | Profile of the peer process |
-| `peer=(addr=...)` | `peer=(addr="@other")` | Address the peer is bound to |
-
-### Examples
-
-```apparmor
-unix,                                                 # All unix socket access
-unix (bind, listen) addr="@/my-app/ipc",              # Listen on abstract socket
-unix (connect, send, receive) peer=(label=unconfined),# Talk to unconfined peers
-unix (send receive) type=stream addr=none,            # Unnamed socketpair
-unix (getattr, shutdown) addr=none,
-deny unix bind addr="/var/run/malicious.sock",
-```
-
-When both a coarse `network unix,` rule and a fine-grained `unix` rule exist, both must permit the operation. Prefer the fine-grained form in modern profiles.
-
----
-
-## 12. Profile Attachment via Extended Attributes (AppArmor 3.x+)
-
-Normally a profile attaches by path — `/etc/apparmor.d/usr.bin.foo` confines `/usr/bin/foo`. But if two binaries share a path (e.g. inside containers) or a binary is relocated, path-based attachment breaks. The `xattrs()` condition attaches by inode xattr instead.
-
-```apparmor
-profile NAME PATH xattrs=(xattr_name="value" ...) { ... }
-```
-
-### Example
-
-```apparmor
-profile trusted_helper /usr/local/bin/* xattrs=(security.apparmor="trusted") {
-  #include <abstractions/base>
-  /usr/local/bin/* mr,
-  # ...
-}
-```
-
-The profile attaches only to binaries under `/usr/local/bin/` that have the xattr `security.apparmor="trusted"`. Set the xattr with:
-
-```bash
-sudo setfattr -n security.apparmor -v trusted /usr/local/bin/my-helper
-```
-
-Use cases: signing a binary for elevated confinement, distinguishing distro-shipped vs sideloaded copies of the same binary name, container orchestration where the same path has different trust levels. Requires a recent kernel + parser (AppArmor 3.0+). Not available on very old LTS kernels.
-
----
-
-## 13. Message Queue Rules (AppArmor 3.x+)
-
-POSIX and SysV message queues are mediated by the `mqueue` rule.
-
-```apparmor
-[audit] [deny] mqueue [ACCESS] [type=TYPE] [label=LABEL] [NAME],
-```
-
-Access keywords: `create`, `open`, `delete`, `read`, `write`, `getattr`, `setattr`.
-
-Types: `posix` (POSIX `mq_open`), `sysv` (SysV `msgget`).
-
-### Examples
-
-```apparmor
-mqueue,                                         # All message queue access
-mqueue (open, read, write) type=posix /myqueue,
-mqueue (create, delete) type=sysv,
-deny mqueue,                                    # Block all MQ access
-```
-
-Most applications don't use message queues; `deny mqueue,` is a safe default for hardened profiles unless the app explicitly needs them.
+➡ **See `rules-advanced.md`** when the app actually uses one of these, or when hardening wants an explicit `deny` on one (`deny userns,`, `deny io_uring,`, `deny mqueue,`). Note in particular the `userns,` rule — it is the Ubuntu 23.10+ mechanism behind every "Electron app won't launch on 24.04" bug (`electron-chromium.md`).

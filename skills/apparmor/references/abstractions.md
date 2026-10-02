@@ -33,8 +33,15 @@ Abstractions are reusable rule bundles stored in `/etc/apparmor.d/abstractions/`
 | `wayland` | Wayland compositor access |
 | `freedesktop.org` | XDG base directories, MIME types, icons |
 | `fonts` | System and user font directories |
-| `dbus-session` | DBus session bus access |
-| `dbus-strict` | Minimal DBus access |
+| `dbus` / `dbus-strict` | **System** bus — the socket is a filesystem path (`@{run}/dbus/system_bus_socket`); `-strict` is the tighter variant |
+| `dbus-session` / `dbus-session-strict` | **Session** bus — the socket is an abstract-namespace AF_UNIX address (`unix ... addr="@/tmp/dbus-*"`); `-strict` is the tighter variant |
+
+**DBus is its own rule class, and `abstractions/base` does not grant it.** base provides fine-grained `unix` IPC rules but carries no `dbus` rule and no bus-socket path — so a profile that includes only base gets neither the bus socket nor the ability to make calls. Two separate things are needed to talk to a bus:
+
+1. The **socket** — include the matching transport abstraction: `abstractions/dbus` (or `dbus-strict`) for the system bus, `dbus-session` (or `dbus-session-strict`) for the session bus (or write the socket rule yourself).
+2. The **method calls** — mediated separately again. Neither `network,` nor a broad `/** rw` nor the socket grant covers them; you still need a `dbus` rule (broad `dbus,` or scoped `dbus send bus=system ...`).
+
+**Signature of a missing `dbus` rule:** the app crashes at init with *no file denial* — e.g. it does a `Hello` handshake on the bus at startup, is denied, and aborts. Because DBus is enforced in userspace by `dbus-daemon`, the denial is a `USER_AVC` that **never reaches `dmesg`** — find it with `sudo ausearch -m USER_AVC -ts recent` (see hardening.md §4).
 
 ### Application abstractions
 

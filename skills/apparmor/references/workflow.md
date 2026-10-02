@@ -234,6 +234,15 @@ grep forbidden /tmp/s.out
 
 A successful FD despite a `deny` rule usually means: the path didn't match (glob too narrow, symlink resolved elsewhere — see hardening.md pitfall 11), or the rule was for the wrong qualifier.
 
+### `sudo aa-exec` is faithful for *deny* checks, not for *allow* checks
+
+`sudo aa-exec -p <profile> -- <cmd>` is the right tool to confirm a **deny fires** — you reproduce the denial in isolation without running the whole app. But it is **not** a faithful stand-in for verifying an **allow works**, because `sudo` changes two things besides the profile:
+
+- **euid becomes 0.** Every `owner @{HOME}/...` rule stops matching (fsuid ≠ file owner), so an access the real user would get is denied under `aa-exec` — the profile looks broken when it isn't. A `@{HOME}` *deny* also now hits `/root` as well. (`@{HOME}` itself is a static tunable, so non-`owner` `@{HOME}` rules still match.)
+- **The mount view can differ.** An access your rules genuinely allow (`/** rw`) can fail with `EACCES` and **zero AVCs** — the mount namespace denied it, not AppArmor. An empty audit log next to an `EACCES` is the tell: a missing *allow* would have logged an AVC, so no AVC means the block is elsewhere.
+
+**Rule:** validate file-access and GUI behavior from the **real caller at the real uid** (the app from the user's own shell, or the file-manager action — no sudo, no `aa-exec`). Use `aa-exec`/complain only to *read a deny you have already reproduced*, never to conclude an *allow* is missing.
+
 ### Exit 0 is not proof the profile is complete — apps swallow `EACCES`
 
 The natural verification "run it, does it work?" is unreliable for *allow* coverage. Many applications treat a blocked write as non-fatal: they catch the error, skip the operation, and continue with exit 0 and nothing on stderr. A confined CLI that *appears* to work can be silently degraded — response cache not written, telemetry dropped, state files not persisted — with **zero observable signal**. Exit 0 only proves the hot path didn't hard-fail, not that the profile covers everything the app touches.

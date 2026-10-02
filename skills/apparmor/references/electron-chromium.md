@@ -58,7 +58,7 @@ Critical pieces:
 - **`abi <abi/4.0>,`** — required for the `userns` rule to parse. AppArmor 3.x parsers will reject the rule.
 - **`flags=(unconfined)`** — the profile is *attached* to the binary (so `userns_create` is allowed) but does not actually restrict file/network/capability access. This is the Chromium-recommended approach because writing a fully-confined profile for a complex Electron app is brittle and breaks on every app update.
 - **`userns,`** — the rule that authorizes `unshare(CLONE_NEWUSER)`.
-- **`include if exists <local/...>`** — lets sysadmins layer extra rules without editing the vendor profile.
+- **`include if exists <local/...>`** — lets sysadmins layer extra rules without editing the vendor profile. **Caveat:** on `apparmor_parser` 4.0.0/4.0.1, dropping a deny rule into that `local/` include silently demotes the whole `flags=(unconfined)` profile to `enforce` and breaks the app. Before shipping a `local/` deny include, check `parser-bugs/4.0.0-4.0.1-unconfined-mediation.md` for the version gate.
 
 ### File naming
 

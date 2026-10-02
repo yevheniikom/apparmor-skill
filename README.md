@@ -50,17 +50,19 @@ The skill only generates and explains profiles, so you can also run it on any ma
 
 ## Under the hood
 
-Beyond the SKILL prompt, the plugin ships seven focused reference documents the skill pulls in on demand — this is where the depth lives:
+Beyond the SKILL prompt, the plugin ships nine focused reference documents the skill pulls in on demand — this is where the depth lives:
 
 | File                              | Covers                                                                     |
 | --------------------------------- | -------------------------------------------------------------------------- |
 | `references/rules.md`             | Full profile syntax: file, network, capability, signal, DBus, mount        |
+| `references/rules-advanced.md`    | 4.0+/3.x primitives: userns, io_uring, fine-grained unix, xattrs, mqueue   |
 | `references/hardening.md`         | Deny rules, audit mode, 12 common pitfalls with BAD/GOOD examples          |
 | `references/abstractions.md`      | Available abstractions, tunables, runtime domain transitions               |
 | `references/workflow.md`          | complain→enforce lifecycle, tool reference, profile template               |
 | `references/electron-chromium.md` | Electron/Chromium/AppImage profiles, Ubuntu 24.04+ `userns,` fix           |
 | `references/child-processes.md`   | Exec transitions (`ix`, `Px`, `Cx`), multi-process patterns                |
 | `references/docker.md`            | `docker-default`, `--security-opt`, Kubernetes, container escape hardening |
+| `references/parser-bugs/`         | Known `apparmor_parser` bugs by version, with symptoms and workarounds     |
 
 ## License
 

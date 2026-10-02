@@ -24,7 +24,9 @@ Profiles operate in two modes: **enforce** (block and log violations) and **comp
 
 The references/ directory contains detailed documentation split by domain. Read the appropriate file based on the task:
 
-- **references/rules.md** -- Complete syntax for all rule types: profile structure, file permissions, glob patterns (AARE), network, capability, signal, DBus, and mount rules. Read when creating a new profile, editing access rules, or looking up the syntax for any rule type.
+- **references/rules.md** -- Syntax for the everyday rule types: profile structure, file permissions, glob patterns (AARE), network, capability, signal, DBus, and mount rules. Read when creating a new profile, editing access rules, or looking up the syntax for any of these. (Advanced/4.0+ primitives are split into rules-advanced.md.)
+
+- **references/rules-advanced.md** -- Advanced/AppArmor 4.0+ (and 3.x) rule primitives most profiles never need: user namespaces (`userns,` — the Ubuntu 23.10+ Electron/`unshare` restriction), `io_uring`, fine-grained AF_UNIX sockets (standalone `unix` rule), profile attachment by xattr (`xattrs()`), and message queues (`mqueue`). Read only when the app actually uses one of these, or when hardening wants an explicit `deny` on one (`deny userns,`/`deny io_uring,`/`deny mqueue,`).
 
 - **references/hardening.md** -- Deny rules, audit mode, and the twelve most common pitfalls (numbered 1-12, with 2b) each with BAD/GOOD examples. Read when hardening a profile, troubleshooting unexpected denials, setting up monitoring, or debugging silent failures.
 
@@ -33,6 +35,8 @@ The references/ directory contains detailed documentation split by domain. Read 
 - **references/workflow.md** -- Development lifecycle (complain-to-enforce), tool reference (aa-genprof, aa-logprof, etc.), management commands, local overrides, profile naming conventions, and a complete production-ready profile template. Read when managing profiles, looking up tool usage, or needing a quick-start template.
 
 - **references/electron-chromium.md** -- Electron, Chromium, Chrome, and any Chromium-based app (Signal, Bitwarden, Obsidian, VSCode, Slack, Discord, Jitsi, Element, etc.), including the Ubuntu 24.04+ `unprivileged_userns` problem, the `userns,` rule, the chrome-sandbox SUID helper, AppImage path wildcards, and full-confinement vs. minimal `flags=(unconfined)` profiles. Read whenever the user mentions an Electron/Chromium app failing to launch, sandbox errors, `chrome-sandbox`, or `kernel.apparmor_restrict_unprivileged_userns`.
+
+- **references/parser-bugs/** -- Version-specific `apparmor_parser` bugs and their version gates, one file per bug. Currently: `4.0.0-4.0.1-unconfined-mediation.md` (a `flags=(unconfined)` profile with body rules is silently demoted to enforce on parser 4.0.0/4.0.1). Read when shipping a `local/` deny include for an unconfined stub profile, or when an Electron/Firefox stub inexplicably runs enforced.
 
 - **references/child-processes.md** -- Multi-process apps in general: **exec-time** transitions (`ix`, `Px`/`px`, `Cx`/`cx`, `Ux`/`ux`, named transitions), child profiles declared inside a parent, profile stacking (AppArmor 4.0), and patterns for browser-style sandboxes, sandbox runtimes (bwrap/firejail/nsjail), CI runners, setuid helpers, and systemd workers. Read whenever you need to confine a program that spawns other programs via `execve`, or whenever exec-transition rules are involved. (For `change_hat`/`change_profile` runtime API calls, see abstractions.md.)
 
@@ -144,7 +148,20 @@ Hardening checklist:
 
 ### 3. Analyze Denial Logs and Fix Profiles
 
-AppArmor denials appear in the kernel log. Parse them to understand what's being blocked:
+**Before writing or widening any rule, diagnose in this order — it saves the most time:**
+
+1. **Is this path even allowed by an existing rule?** Read the profile and check whether a rule already covers the denied path with the right permission mask. If the intended rule is there but not firing, do NOT assume you need a *new* allow — the rule is probably matching a different string than the kernel checked (go to step 2).
+2. **Is the path a symlink on THIS system?** AppArmor matches the **resolved** path, not the one you wrote. Symlinks are resolved *before* rule matching, so a rule on the symlink path never fires. This is the single most common time-sink in profile debugging, and it is invisible until you look — the error text names the path you wrote, not the one the kernel matched. Always run:
+
+   ```bash
+   readlink -f <denied-path>        # the path AppArmor actually matches
+   ls -ld <denied-path> $(dirname <denied-path>)   # is any parent a symlink?
+   head -1 <script>                 # if it's a script, its #! interpreter is ALSO resolved
+   ```
+
+   Common traps: `~/.ssh`/`~/.config/X` when `$HOME` is on a mounted volume; `~/.var/app` (Flatpak) or `~/snap` on another disk; `/bin/sh` → `/usr/bin/dash` (merged-usr); `*latex` → `xetex`/`pdftex`; `/proc/self/fd/N`. Write the rule on the **resolved** target (and, for dotdirs that may live behind a home-on-a-mount symlink, add a wildcard mirror like `/**/.ssh/{,**}` keeping the meaningful component). See `references/hardening.md` pitfall 11.
+
+Only once both are ruled out should you treat the denial as a genuinely missing allow. Then parse the denial to see exactly what's being blocked:
 
 ```bash
 # Recent AppArmor denials
@@ -299,6 +316,7 @@ Profile files in `/etc/apparmor.d/` are named by replacing `/` with `.` in the b
 
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
+| "Permission denied" and a rule for the path already looks correct | The rule is matching a different string than the kernel checked -- almost always because the path is a **symlink**, which AppArmor resolves *before* matching | Diagnose in order (Workflow 3): (1) confirm a rule covers the path with the right mask; (2) `readlink -f <path>` and `ls -ld` its parents -- if any is a symlink, write the rule on the **resolved** target (add a `/**/<dir>/` mirror for home-on-a-mount dotdirs). Don't add a new allow until both are ruled out. See hardening.md pitfall 11 |
 | App crashes immediately | Missing `abstractions/base` or library `m` permission | Add `#include <abstractions/base>` and `/usr/lib/@{multiarch}/** rm,` |
 | DNS resolution fails | Missing nameservice abstraction | Add `#include <abstractions/nameservice>` |
 | "Permission denied" but no log | `deny` rule without `audit` suppresses logging | Change `deny` to `audit deny` to see it, or add `flags=(audit)` |
@@ -315,6 +333,7 @@ Profile files in `/etc/apparmor.d/` are named by replacing `/` with `.` in the b
 | Electron app crashes on launch (Ubuntu 24.04+) with SIGSEGV or "setuid sandbox is not running" | Missing `userns,` rule -- Chromium can't create the namespace sandbox | Add `abi <abi/4.0>,` and a profile with `flags=(unconfined)` + `userns,` for the binary path -- see `references/electron-chromium.md` |
 | `bwrap: setting up uid map: Permission denied` (Flatpak, sandbox-runtime) | Same root cause as Electron -- `bwrap` needs `userns,` | On Ubuntu 24.04+ the apparmor package ships `/etc/apparmor.d/bwrap-userns-restrict` (or similar) -- update the apparmor package and reload. On other distros the profile may live in `/usr/share/apparmor/extra-profiles/`; symlink it into `/etc/apparmor.d/`. Or write your own minimal profile with `userns,` for `/usr/bin/bwrap` |
 | Electron app launches but tabs/windows crash | Renderer child profile missing `userns,` | The `userns,` rule is per-profile, not inherited -- add it to the child profile too |
+| A `flags=(unconfined)` stub profile runs *enforced* after you added a `local/` deny include; app dies with `uid_map`/dconf/Wayland `EACCES` | Parser 4.0.0/4.0.1 bug: any body rule on an unconfined profile silently demotes it to enforce | Confirm the parser has the fix (`dpkg-query -W apparmor`; `--version` alone is insufficient) -- upstream ≥ 4.0.2 / Noble ≥ `4.0.1really4.0.1-0ubuntu0.24.04.3`. On an unpatched parser, don't ship the `local/` deny include. See `references/parser-bugs/4.0.0-4.0.1-unconfined-mediation.md` |
 | `Cx` exec rule fails the child exec | Child profile name doesn't match binary basename, or no named target | Use `Cx -> name,` to explicitly name the target child profile; verify the `profile name { ... }` block exists inside the parent |
 | `Px` exec rule fails the child exec | The named profile doesn't exist in `/etc/apparmor.d/` | Use `Pix` (with inherit fallback) during development, or write the missing profile |
 | Worker processes turn into zombies, parent can't kill them | Missing `signal (send)` rule | Add `signal (send) set=(term kill) peer=child-profile-name,` to the parent |
