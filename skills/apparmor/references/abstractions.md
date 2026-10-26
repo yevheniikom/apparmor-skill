@@ -1,6 +1,6 @@
-# AppArmor Abstractions, Tunables, and Profile Transitions
+# AppArmor Abstractions, Tunables, and Runtime Domain Changes
 
-Reusable rule bundles, variables, and how child processes inherit or switch confinement.
+Reusable rule bundles, variables, and the domain changes a program makes itself through libapparmor (`change_hat`, `change_profile`). Exec-time transitions and stacking are in `child-processes.md`.
 
 ---
 
@@ -87,16 +87,16 @@ Tunables are variable definitions stored in `/etc/apparmor.d/tunables/`. They ar
 
 | Variable | Default Value | Purpose |
 |----------|---------------|---------|
-| `@{HOME}` | `/home/*/` | User home directories |
+| `@{HOME}` | `@{HOMEDIRS}/*/ /root/` | User home directories, **including `/root/`** |
 | `@{HOMEDIRS}` | `/home/` | Parent directory of homes |
 | `@{PROC}` | `/proc/` | Procfs mount |
 | `@{sys}` | `/sys/` | Sysfs mount |
-| `@{run}` | `/run/` | Runtime data directory |
-| `@{pid}` | `[1-9]*` | Process ID pattern |
-| `@{pids}` | `[1-9]*` | Process IDs pattern (alias) |
-| `@{tid}` | `[1-9]*` | Thread ID pattern |
+| `@{run}` | `/run/ /var/run/` | Runtime data directory |
+| `@{pid}` | 1-7 digit alternation, no leading zero (`{[1-9],[1-9][0-9],…}`) | Process ID pattern (`tunables/kernelvars`) |
+| `@{pids}` | `@{pid}` | Same pattern |
+| `@{tid}` | `@{pid}` | Thread ID pattern (same pattern) |
 | `@{multiarch}` | `*-linux-gnu*` | Multiarch lib triplet |
-| `@{securityfs}` | `/sys/kernel/security/` | Security filesystem |
+| `@{securityfs}` | `@{sys}/kernel/security/` | Security filesystem |
 | `@{apparmorfs}` | `@{securityfs}/apparmor/` | AppArmor filesystem |
 | `@{profile_name}` | (runtime) | Current profile name |
 

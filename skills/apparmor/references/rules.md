@@ -4,7 +4,7 @@ Syntax reference for the everyday AppArmor rule types: profile structure, file p
 
 ## Contents
 
-1. [Profile Structure](#1-profile-structure) — preamble, header, flags, `priority=`, `flags=(unconfined)`, `attach_disconnected`/`@{att}`
+1. [Profile Structure](#1-profile-structure) — preamble, header, flags, `priority=` (4.1+), `flags=(unconfined)`, `attach_disconnected`/`@{att}`
 2. [File Permissions](#2-file-permissions) — access modes, exec transitions (`ix`/`Px`/`Cx`/…), fallbacks, the `owner` conditional, the `link ->` rule for hard links
 3. [Glob Patterns (AARE)](#3-glob-patterns-aare) — `*` vs `**`, the `/usr/lib/*/*` flat-helper trap, quoted-path brace limits
 4. [Network Rules](#4-network-rules) — domains/types/protocols; the "never blanket-`deny network,` in a GUI profile" trap
@@ -53,7 +53,7 @@ profile myapp /usr/bin/myapp flags=(enforce) {
 | Element | Purpose | Example |
 |---------|---------|---------|
 | `abi` | Declares policy ABI version | `abi <abi/4.0>,` |
-| `#include` | Pulls in shared rule sets | `#include <tunables/global>` |
+| `#include` / `include` | Pulls in shared rule sets; the leading `#` is optional, and `include if exists` skips a missing file | `#include <tunables/global>` |
 | `@{VAR}` | Defines or appends variables | `@{LOG} = /var/log/myapp` |
 | `alias` | Path rewriting | `alias /old/ -> /new/,` |
 
@@ -82,16 +82,16 @@ profile myapp /usr/bin/myapp flags=(enforce) {
 | `attach_disconnected` | Re-attach namespace-detached paths so the rule engine can address them (see "Confining namespace-creating tools" below) |
 | `chroot_relative` | Resolve paths relative to chroot |
 
-### Rule priority (AppArmor 4.0+)
+### Rule priority (AppArmor 4.1+)
 
-AppArmor 4.0 adds a numeric `priority=N` qualifier on individual rules (range -1000 to 1000, default 0). Higher-priority rules completely override lower-priority rules where they overlap, **regardless** of the normal `deny > allow` precedence. This is the mechanism for building layered abstractions where a caller can opt out of a bundled deny.
+AppArmor 4.1 adds a numeric `priority=N` qualifier on individual rules (range -1000 to 1000, default 0, per upstream `parser/apparmor.d.pod`; it cannot be applied to block rules). Higher-priority rules completely override lower-priority rules where they overlap, **regardless** of the normal `deny > allow` precedence. This is the mechanism for building layered abstractions where a caller can opt out of a bundled deny.
 
 ```apparmor
 priority=10 audit deny @{HOME}/.ssh/{,**} rwmlk,    # shared abstraction
 priority=20 owner @{HOME}/.ssh/{,**} r,              # ssh-agent opts back in
 ```
 
-The allow wins here because `20 > 10`. Without priorities, the deny would always win and no consumer could re-enable access. Requires `abi <abi/4.0>,` and AppArmor 4.0+ kernel/parser. Use sparingly — most conflicts are better resolved by restructuring rules (see hardening.md §3 pitfall 4).
+The allow wins here because `20 > 10`. Without priorities, the deny would always win and no consumer could re-enable access. Requires an AppArmor 4.1+ parser: the 4.0.1 parser in Ubuntu 24.04 rejects it (`syntax error, unexpected TOK_CONDID`), and the `aa-*` utilities only understand it from 4.1.1. Use sparingly — most conflicts are better resolved by restructuring rules (see hardening.md §3 pitfall 4).
 
 ### What `flags=(unconfined)` actually does — it is label-only
 
@@ -104,7 +104,7 @@ The one rule that *does* take effect is `userns,` — which is exactly why every
 
 **Architectural consequence:** you cannot build a "trampoline with denies" out of an unconfined profile — granting userns freedom via `unconfined` simultaneously discards all rule mediation. If a profile must allow `userns,` *and* enforce policy, the policy has to live in a different profile that the userspace tool transitions into, or rely on the tool's own sandbox primitives (bwrap `--ro-bind`, seccomp, landlock). Verify which label is actually in effect with `cat /proc/self/attr/current` under `aa-exec --profile=<name>` — if a known-denied path is readable, no confinement is happening (see workflow.md §4).
 
-> **Version trap:** on `apparmor_parser` 4.0.0/4.0.1, adding *any* body rule to a `flags=(unconfined)` profile (including via `include if exists <local/...>`) silently demotes it to `enforce`. Before shipping a `local/` deny include for an unconfined stub profile, see `parser-bugs/4.0.0-4.0.1-unconfined-mediation.md`.
+> **Version trap:** on parser 4.0.0/4.0.1 any body rule demotes an unconfined profile to enforce — see `parser-bugs/4.0.0-4.0.1-unconfined-mediation.md`.
 
 ### Confining namespace-creating tools: `attach_disconnected` and `@{att}`
 
@@ -144,7 +144,7 @@ File rules grant or deny specific access modes on path patterns.
 | `a` | Append | Conflicts with `w`; write-only at EOF |
 | `m` | Memory-map with `PROT_EXEC` | Required for shared libraries |
 | `k` | File locking (`flock`, `fcntl`) | |
-| `l` | Hard link creation | Requires both `l` on the link name and the target's permissions — **and** an explicit `link` rule (below) |
+| `l` | Hard link creation | Shorthand for `link subset <path> -> /**`: the link may not carry more permissions than its target (see "Hard links" below) |
 
 ### Execute transition modes
 
@@ -197,7 +197,7 @@ owner /home/*/.ssh/** r,
 
 **Where `owner` does belong:** genuinely per-process / per-user private state where a cross-uid match would itself be the anomaly — `owner @{PROC}/@{pid}/**`, `owner /run/user/[0-9]*/**`, `owner @{HOME}/.config/**` / `.cache/**` / `.Xauthority`. Add it only when you can name the cross-uid access it stops, and never silently — leave a comment saying which read it blocks, or a later session will trip over it during `aa-exec` testing.
 
-### Hard links need an explicit `link` rule — the `l` mode alone is not enough
+### Hard links: what `l` grants, and when you need an explicit `link` rule
 
 Creating a hard link is mediated as its own operation, with a dedicated rule form:
 
@@ -205,21 +205,24 @@ Creating a hard link is mediated as its own operation, with a dedicated rule for
 [audit] [deny] link [subset] PATH -> TARGET,
 ```
 
-Two things must both be present for `link(oldpath, newpath)` (or `linkat`) to succeed under a profile:
+The `l` mode in a file rule is shorthand for a subset link rule. Per `apparmor.d(5)`, these three are equivalent:
 
-1. The `l` **mode** on the relevant file rules — on the **new** link name, and read/write as appropriate on the target. `l` in a plain file rule authorizes *link* as an access mode.
-2. An explicit **`link` rule** naming source and target: `link /path/new -> /path/target,`. Without it, the create is denied even when both paths carry `l`.
-
-The `subset` keyword restricts the new link so it cannot grant more access than the target already has (the safe default for most link rules).
-
-This bites whenever a program creates a file by linking a temporary name onto the final path rather than writing it directly — atomic-save editors (`write tmp; link/rename onto target`), lockfile creators, and Unix-socket mux servers (`muxserver_listen()` does `link(tmpname, socketpath)`). The temp name usually has a random suffix, so it needs a glob, and it is mediated **separately** from the visible target:
-
-```apparmor
-owner @{HOME}/.ssh/sockets/**   rwkl,               # k: ssh flocks the socket; l: link mode
-link  @{HOME}/.ssh/sockets/** -> @{HOME}/.ssh/sockets/**,
+```
+/foo l,
+l /foo,
+link subset /foo -> /**,
 ```
 
-Symptom of the missing `link` rule: the operation fails even though `rw`/`k` on the path look correct, and (if the path is reached via a symlink onto a mount) the rule may also be matching the wrong resolved string — see §3 and hardening.md pitfall 11.
+`subset` means the new link name may not carry more permissions than the target already has: a link `/link*` with `rw` may point at a target the profile grants `rwk`, but not at one it grants only `r`. So `l` alone is enough whenever the target is covered by rules granting at least the link's permissions. Write an explicit `link` rule when that subset check fails (the target is reached via a different resolved path, or is covered by a narrower rule), or when you want to pin which targets a link may point to.
+
+This bites whenever a program creates a file by linking a temporary name onto the final path rather than writing it directly: atomic-save editors (`write tmp; link/rename onto target`), lockfile creators, and Unix-socket mux servers (`muxserver_listen()` does `link(tmpname, socketpath)`). The temp name usually has a random suffix, so it needs a glob, and it is mediated **separately** from the visible target:
+
+```apparmor
+owner @{HOME}/.ssh/sockets/**   rwkl,               # k: ssh flocks the socket; l: subset link
+link  @{HOME}/.ssh/sockets/** -> @{HOME}/.ssh/sockets/**,   # explicit form, if the subset check fails
+```
+
+Symptom of a failed link check: the operation fails even though `rw`/`k` on the path look correct, and (if the path is reached via a symlink onto a mount) the rule may also be matching the wrong resolved string — see §3 and hardening.md pitfall 11.
 
 ### Examples
 
@@ -270,9 +273,8 @@ AppArmor uses AppArmor Regular Expressions (AARE), which are similar to shell gl
 
 ### Common mistakes
 
-- Using `*` when `**` is needed (misses nested files).
 - Forgetting the trailing `,` on rules.
-- Using `**` too broadly (matches far more than intended).
+- `*` where `**` is needed, and over-broad `**`: see hardening.md §3 pitfalls 1–2 (BAD/GOOD examples).
 
 ### `*` does not cross `/` — Debian flat helper dirs are a common casualty
 

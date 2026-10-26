@@ -55,10 +55,10 @@ profile signal-desktop /opt/Signal/signal-desktop flags=(unconfined) {
 
 Critical pieces:
 
-- **`abi <abi/4.0>,`** — required for the `userns` rule to parse. AppArmor 3.x parsers will reject the rule.
+- **`abi <abi/4.0>,`** — required for the `userns` rule to be *enforced*. A 4.x parser without it accepts the rule but compiles it out (pitfall 2); 3.x parsers predate the `userns` rule entirely.
 - **`flags=(unconfined)`** — the profile is *attached* to the binary (so `userns_create` is allowed) but does not actually restrict file/network/capability access. This is the Chromium-recommended approach because writing a fully-confined profile for a complex Electron app is brittle and breaks on every app update.
 - **`userns,`** — the rule that authorizes `unshare(CLONE_NEWUSER)`.
-- **`include if exists <local/...>`** — lets sysadmins layer extra rules without editing the vendor profile. **Caveat:** on `apparmor_parser` 4.0.0/4.0.1, dropping a deny rule into that `local/` include silently demotes the whole `flags=(unconfined)` profile to `enforce` and breaks the app. Before shipping a `local/` deny include, check `parser-bugs/4.0.0-4.0.1-unconfined-mediation.md` for the version gate.
+- **`include if exists <local/...>`** — lets sysadmins layer extra rules without editing the vendor profile. **Don't put deny rules there** for an unconfined stub: they give no protection on any parser and break the app on 4.0.0/4.0.1 (`parser-bugs/4.0.0-4.0.1-unconfined-mediation.md`).
 
 ### File naming
 
@@ -74,7 +74,7 @@ Save the profile as `/etc/apparmor.d/<path-with-dots>`:
 Load it:
 
 ```bash
-sudo apparmor_parser -r /etc/apparmor.d/opt.Signal.signal-desktop
+sudo apparmor_parser -rK /etc/apparmor.d/opt.Signal.signal-desktop
 sudo aa-status | grep signal-desktop   # verify it's loaded
 ```
 
@@ -243,24 +243,28 @@ sudo aa-status | grep -i myapp
 /opt/MyApp/myapp 2>&1 | head -20
 # Look for absence of "namespace sandbox" / "setuid sandbox" errors
 
-# 3. Renderer is sandboxed (open chrome://sandbox in Electron with --enable-features=ElectronSerialChooser, or use built-in DevTools)
-# All rows should show "You are adequately sandboxed."
+# 3. Renderers really got their own user namespace: a renderer's user-ns
+#    inode differs from the main process's
+MAIN=$(pgrep -o -f /opt/MyApp/myapp)
+REND=$(pgrep -f -- '--type=renderer' | head -1)
+readlink /proc/$MAIN/ns/user /proc/$REND/ns/user   # two different user:[...] ids
 
-# 4. No new denials in dmesg after exercising the app
-sudo dmesg | grep -i "apparmor.*DENIED" | grep myapp | tail
+# 4. No new denials after exercising the app (ausearch, not dmesg: DBus
+#    denials are USER_AVC and never reach the kernel ring buffer; hardening.md §4)
+sudo ausearch -m AVC,USER_AVC -ts recent | grep myapp
 ```
 
 If row 3 shows "Namespace Sandbox: No", the `userns,` rule is missing or the profile didn't attach. Check `aa-status` for the exact profile name and that it matches the binary path.
 
 ## Common pitfalls specific to Electron/Chromium
 
-1. **Profile must declare its attachment path** — if you write `profile myapp { ... }` without an attachment specification, the kernel will not auto-attach it on `execve` of any binary. The profile loads but is dormant -- it can only be entered via an explicit `change_profile` call from inside another profile, which Electron apps never do. Result: the binary at `/opt/MyApp/myapp` runs unconfined and `userns,` is not granted. Always use `profile myapp /opt/MyApp/myapp { ... }` so the kernel attaches the profile when that binary is exec'd.
+1. **Profile must declare its attachment path** — `profile myapp { ... }` without one never attaches on `execve`, so the app runs unconfined and gets no `userns,`. Use `profile myapp /opt/MyApp/myapp { ... }` (`workflow.md` §2).
 
-2. **Forgetting `abi <abi/4.0>,`** — older parsers silently ignore unknown rules. Without the ABI declaration, `userns,` may parse but do nothing. `apparmor_parser -QTK` does NOT catch this.
+2. **Forgetting `abi <abi/4.0>,`** — with no `abi` line the parser falls back to its default feature ABI; with `abi <abi/3.0>,` it uses the 3.0 feature set. Neither contains `userns`, so the rule compiles (exit 0, no message) and is **dropped**: the app still fails to create its namespace. Verified on parser 4.0.1. Plain `apparmor_parser -QTK` does not show this; `apparmor_parser -QTK --warn=rule-not-enforced <file>` reports it (on 4.0.1: `userns rules not enforced`).
 
-3. **Putting `userns,` only in the parent** — renderers re-call `unshare(CLONE_NEWUSER)`. If the child profile (or inherited parent profile) doesn't have `userns,`, individual tabs/documents crash even though the app launches.
+3. **Putting `userns,` only in the parent** — renderers call `unshare(CLONE_NEWUSER)` again, so their child profile needs `userns,` too, or tabs crash while the app launches (`rules-advanced.md` §1).
 
-4. **Using `Px` for the renderer transition** — `Px` requires a profile named exactly the same as the binary. Chromium and Electron re-exec the same binary path with different `--type=` flags (first `--type=zygote`, which then forks renderers, GPU, and utility children — those forks inherit the zygote's profile without re-exec, so only the *first* zygote-spawning exec needs a transition rule). `Px` would loop back into the parent profile. Use `Cx -> sandbox` (child profile) or `Pix` (transition with inherit fallback). One child profile typically covers all `--type=*` children since they share the same binary path.
+4. **Using `Px` for the renderer transition** — `Px` picks the profile attached to the child's path, and here that path is the parent's own binary. Chromium and Electron re-exec the same binary path with different `--type=` flags (first `--type=zygote`, which then forks renderers, GPU, and utility children — those forks inherit the zygote's profile without re-exec, so only the *first* zygote-spawning exec needs a transition rule). `Px` (and `Pix`) would therefore loop back into the parent profile. Use `Cx -> sandbox` (a child profile). One child profile typically covers all `--type=*` children since they share the same binary path.
 
 5. **JIT crashes** — V8 needs `PROT_EXEC` on anonymous mappings. AppArmor doesn't restrict this directly, but if you've layered seccomp or another LSM that blocks `mprotect(PROT_EXEC)`, JIT fails. Symptom: the app loads but every page is blank with `[1234:1234:0101/000000.000000:FATAL:v8_initializer.cc(...)] Check failed`.
 

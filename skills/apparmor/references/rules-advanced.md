@@ -47,7 +47,7 @@ Access keywords:
 | Keyword | Meaning |
 |---------|---------|
 | `sqpoll` | Allow creating io_uring instances with the SQPOLL (kernel poller thread) feature |
-| `override_creds` | Allow io_uring operations to run under different credentials (`IORING_REGISTER_PERSONALITY` / `IOSQE_FIXED_FILE`) |
+| `override_creds` | Allow the task to override its credentials to the given `label` when executing an io_uring operation (`apparmor.d(5)`); the userspace mechanism is a personality registered with `IORING_REGISTER_PERSONALITY` |
 
 ### Examples
 

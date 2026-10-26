@@ -26,8 +26,9 @@ cat /proc/self/attr/current
 ### Apply a custom profile
 
 ```bash
-# Load your profile into the kernel first (-W writes the cache so the daemon sees it):
-sudo apparmor_parser -r -W /path/to/your_profile
+# Load your profile into the kernel first (-T: don't read a possibly stale cache,
+# -W: refresh it; see hardening.md §3 pitfall 12):
+sudo apparmor_parser -r -T -W /path/to/your_profile
 
 # Then run the container under it (note the '=' — NOT a colon):
 docker run --security-opt apparmor=your_profile <image>
@@ -60,13 +61,13 @@ The profile is generated from Moby's `baseTemplate`
 (`github.com/moby/profiles` → `apparmor/template.go`). Header:
 `flags=(attach_disconnected,mediate_deleted)`. The substantive rules:
 
-| Area | Rule (verbatim from the template) | Effect |
+| Area | Rule (from the template, abridged) | Effect |
 |------|-----------------------------------|--------|
-| Network | `network,` + `deny network alg,` | All sockets allowed except the kernel crypto (AF_ALG) family |
+| Network | `network,` + `deny network <family>,` for ax25, ipx, appletalk, netrom, rose, econet, atmsvc, irda, wanpipe, isdn, caif, alg, vsock | All sockets allowed except obsolete families, kernel crypto (AF_ALG), and AF_VSOCK (blocks host/guest VM communication) |
 | Capabilities | `capability,` | AppArmor allows **all** caps — the *kernel/Docker* cap bounding set is what drops them, not AppArmor |
-| Mounts | `deny mount,` | All mount operations blocked |
+| Mounts | `deny mount,` (`umount,` stays allowed) | Mounting blocked; unmounting is not |
 | `/proc` writes | `deny @{PROC}/* w,`, `deny @{PROC}/sysrq-trigger rwklx,`, `deny @{PROC}/kcore rwklx,`, denies most of `/proc/sys` except `/proc/sys/kernel/shm*` | Writes to top-level `/proc`, `sysrq-trigger`, `kcore`, and almost all of `/proc/sys` are blocked |
-| `/sys` | `deny /sys/[^f]*/** wklx,` … `deny /sys/firmware/** rwklx,`, `deny /sys/kernel/security/** rwklx,` | `/sys` write/exec largely denied except cgroup paths |
+| `/sys` | `deny /sys/[^f]*/** wklx,` … `deny /sys/firmware/** rwklx,`, `deny /sys/devices/virtual/powercap/** rwklx,`, `deny /sys/kernel/security/** rwklx,` | `/sys` write/exec largely denied except cgroup paths |
 | ptrace | `ptrace (...) peer="<profile>",` | ptrace confined to the **same** profile — not a host-probing primitive |
 
 The container also gets `signal (receive) peer=unconfined/runc/crun/<daemon>` so the host

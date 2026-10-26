@@ -42,8 +42,8 @@ aa-enforce /usr/bin/myapp       # 4. Re-enforce after fixing
 # Reload all profiles
 sudo systemctl reload apparmor.service
 
-# Reload a single profile
-sudo apparmor_parser -r /etc/apparmor.d/usr.bin.myapp
+# Reload a single profile (-K: skip the compiled cache, see hardening.md §3 pitfall 12)
+sudo apparmor_parser -rK /etc/apparmor.d/usr.bin.myapp
 
 # Remove (unload) a profile
 sudo apparmor_parser -R /etc/apparmor.d/usr.bin.myapp
@@ -89,7 +89,7 @@ Profile files are stored in `/etc/apparmor.d/` and named by replacing each `/` i
 
 ### Profile name inside the file
 
-The profile name should match the **full absolute path** to the binary:
+What attaches a profile to a binary is its **attachment**: the path in the header, matched against the binary's *resolved* path at `exec()`. The name only has to be unique on the system. Two equivalent forms:
 
 ```
 profile /usr/bin/myapp {
@@ -97,7 +97,7 @@ profile /usr/bin/myapp {
 }
 ```
 
-Or use the `profile` keyword with a descriptive name and an attachment:
+Here the name is a path, so it doubles as the attachment. Or give a short name plus an explicit attachment:
 
 ```
 profile myapp /usr/bin/myapp {
@@ -110,7 +110,7 @@ profile myapp /usr/bin/myapp {
 - Profile names **must not** start with `:` or `.`.
 - Names containing whitespace must be quoted.
 - Unattached profiles (not bound to a binary) require the `profile` keyword.
-- By convention, the profile name matches the binary path for clarity and tooling compatibility.
+- A name of its own (not one that a distro stub or another package also uses) avoids silent load-order collisions.
 - Named profiles referenced by `Px ->` transitions must match exactly.
 
 ---
@@ -169,11 +169,14 @@ profile myapp /usr/bin/myapp flags=(enforce) {
   audit deny @{HOME}/.ssh/{,**}   rwmlk,
   audit deny @{HOME}/.gnupg/{,**} rwmlk,
 
-  # Child profile
+  # Child profile: inherits NOTHING from the parent, so repeat the
+  # sensitive denies here (child-processes.md pitfall 9)
   profile worker /usr/lib/myapp/worker {
     #include <abstractions/base>
     @{app_data}/work/** rw,
     deny network,
+    audit deny @{HOME}/.ssh/{,**}   rwmlk,
+    audit deny @{HOME}/.gnupg/{,**} rwmlk,
   }
 
   # Hat for request handling
@@ -201,7 +204,7 @@ cat /proc/self/attr/current
 # Output: "unconfined", or "<profile-name> (enforce)", or "<profile-name> (complain)"
 ```
 
-**Modern-kernel path**: On kernel ≥5.10 with multiple LSMs active (e.g. `lsm=apparmor,lockdown,yama,bpf`), `/proc/PID/attr/current` can return `EINVAL`. Fall back to the LSM-specific path:
+**Stacked-LSM path**: `/proc/PID/attr/current` belongs to whichever "major" LSM the kernel exposes there. With only minor LSMs beside AppArmor (lockdown, yama, landlock, bpf) it is AppArmor's label. If SELinux or Smack is also active, it may show that LSM's label or fail. The AppArmor-specific file always shows AppArmor's label:
 
 ```bash
 cat /proc/self/attr/apparmor/current

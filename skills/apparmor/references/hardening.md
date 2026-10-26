@@ -15,14 +15,14 @@ When a `deny` rule and an `allow` rule match the same access **at the same prior
 deny /etc/secrets/master.key r,  # deny wins for this specific file
 ```
 
-**Exception — AppArmor 4.0 `priority=N` qualifier**: Rules with a higher numeric priority completely override rules with lower priority where they overlap, regardless of `allow`/`deny`. A `priority=20 allow` beats a `priority=10 deny`. See `rules.md` §1 "Rule priority" for the syntax. This is how shared deny abstractions can be "opted out of" by consumers — but most profiles don't use priorities, so the "deny wins" shorthand is the right default mental model.
+**Exception — AppArmor 4.1+ `priority=N` qualifier**: Rules with a higher numeric priority completely override rules with lower priority where they overlap, regardless of `allow`/`deny`. A `priority=20 allow` beats a `priority=10 deny`. See `rules.md` §1 "Rule priority" for the syntax. This is how shared deny abstractions can be "opted out of" by consumers — but most profiles don't use priorities, so the "deny wins" shorthand is the right default mental model.
 
 ### Behavior in different modes
 
 - **Enforce mode**: `deny` blocks access and (by default) does **not** log the denial.
 - **Complain mode**: a plain `deny` rule is **still enforced** — it blocks access even though the rest of the profile is log-and-allow. This is the critical difference from regular allow rules, and the reason a profile in complain mode is *not* a no-op for your security-critical denies.
 
-  **One caveat that bites in practice:** an `audit deny` rule (deny *with* the `audit` qualifier) is, on current AppArmor, downgraded in complain mode to "log and allow" — i.e. the audited deny does **not** block. This is a long-standing quirk (observed continuously since at least 2016 — Launchpad bug #1580369 — and not specific to any one AppArmor version), not the documented design. The practical consequence: do not rely on a complain-mode profile to enforce your sensitive-path denies if those denies carry the `audit` qualifier. If you need a deny actively enforced while you iterate, either keep it as a plain `deny` (no `audit`) or run the profile in enforce mode. The reliable mental model: **complain mode is for discovering missing *allow* rules, not for testing whether *denies* fire.**
+  **Caveat:** an `audit deny` (with the `audit` qualifier) is downgraded to log-and-allow in complain mode, so it does **not** block -- see §3 pitfall 5.
 
 ### Deny + Audit
 
@@ -45,17 +45,16 @@ audit deny @{HOME}/.bashrc      w,
 
 Why `/{,**}` not `/**`: see §3 pitfall 2b for the full explanation — in short, a bare `/**` misses the directory inode itself, so `ls ~/.ssh/` still enumerates filenames even though reads are blocked.
 
-### Defence in depth: pair `deny` with `deny owner` for sensitive paths
+### Sensitive denies are unconditional
 
-When the profile has a broad `owner`-qualified allow (common for `@{HOME}`), also emit both forms of every sensitive deny:
+When the profile has a broad `owner`-qualified allow (common for `@{HOME}`), a plain `deny` already overrides it for every file, whoever owns it:
 
 ```
 owner @{HOME}/{,**} rw,
-audit deny       @{HOME}/.ssh/{,**} rwmlk,
-audit deny owner @{HOME}/.ssh/{,**} rwmlk,
+audit deny @{HOME}/.ssh/{,**} rwmlk,
 ```
 
-The plain `deny` catches accesses where the process euid doesn't match the file owner; the `deny owner` catches the matched case. Emitting both is the safe default when you can't audit every code path, even though `deny` is documented to take precedence over `allow` regardless of qualifier. See also §3 pitfall 11 — symlink-resolved paths can bypass `@{HOME}/...` patterns entirely.
+Don't add `deny owner` variants: `owner` on a deny narrows it to files the caller owns, so it can only block less (`rules.md` §2 "Owner conditional"). See also §3 pitfall 11 — symlink-resolved paths can bypass `@{HOME}/...` patterns entirely.
 
 ---
 
@@ -182,7 +181,7 @@ deny /etc/shadow rw,
 audit deny /etc/shadow rw,   # logs, but does NOT block in complain mode
 ```
 
-This `audit deny` downgrade is a long-standing quirk (since at least 2016, Launchpad #1580369), not the documented behavior — so it's easy to get burned by it. If you want a sensitive-path deny actively enforced while iterating, drop the `audit` qualifier (plain `deny` *is* enforced in complain) or switch the profile to enforce mode. Treat complain mode as a tool for finding missing *allow* rules, not for verifying *denies*.
+This `audit deny` downgrade is a long-standing quirk, not the documented behavior (LP#1580369 "deny rules not enforced in complain mode", 2016; a 2020 comment there reports the plain-deny case fixed and the audited case still allowing access) — so it's easy to get burned by it. If you want a sensitive-path deny actively enforced while iterating, drop the `audit` qualifier (plain `deny` *is* enforced in complain) or switch the profile to enforce mode. Treat complain mode as a tool for finding missing *allow* rules, not for verifying *denies*.
 
 ### 6. Missing library paths
 
@@ -266,8 +265,6 @@ Flags (per `apparmor_parser(8)`):
 - `-K` / `--skip-cache` — disables cache reading *and* writing, implies `-T`.
 - `-T` / `--skip-read-cache` — read from source every time, still write cache.
 
-Package `postinst` scripts typically call plain `apparmor_parser -r` — that's correct for fresh installs (no stale cache to worry about) but unreliable mid-development.
-
 ---
 
 ## 4. Debugging a "Permission denied" — cross-check three sources
@@ -280,7 +277,7 @@ Gather all three of these and reconcile them:
 
 2. **The audit log — the AppArmor denial record.** Prefer `sudo ausearch -m AVC,USER_AVC -ts recent` over `dmesg`. A record naming the profile and operation confirms AppArmor, and its *resolved* `name=`/`target=` field is the string the kernel actually matched — often not the path you wrote in the rule (§3 pitfall 11, the symlink trap). But absence is **not** conclusive: a *silent* deny rule (no `audit` qualifier) produces no record yet still denies (§3 pitfall 8). So empty output means "either not AppArmor, or a non-audit deny."
 
-   **Why `ausearch`, not `dmesg`/`journalctl -k`:** the kernel ring buffer only carries kernel-mediated denials (`type=1400` AVC). Denials mediated in **userspace** — most importantly DBus, enforced by `dbus-daemon` itself — are logged as `USER_AVC` (`type=1107`) and **never appear in `dmesg`** ([AppArmor auditing docs](https://apparmor.net/monitoring/AppArmorAuditing/)). A confined app that crashes at init reaching the session/system bus with an empty `dmesg` is the classic signature — `operation="dbus_method_call"` shows up only under `ausearch`. Two caveats: (a) `ausearch` has a long-standing bug (LP#1117804) where it can silently skip AppArmor AVCs; if it returns nothing, read `/var/log/audit/audit.log` directly. (b) With **no auditd** running, records fall back to the kernel ring buffer / syslog instead of the audit log — so on a machine without auditd, check `dmesg` and syslog after all.
+   **Why `ausearch`, not `dmesg`/`journalctl -k`:** the kernel ring buffer only carries kernel-mediated denials (`type=1400` AVC). Denials mediated in **userspace** — most importantly DBus, enforced by `dbus-daemon` itself — are logged as `USER_AVC` (`type=1107`) and **never appear in `dmesg`** ([AppArmor auditing docs](https://apparmor.net/monitoring/AppArmorAuditing/)). A confined app that crashes at init reaching the session/system bus with an empty `dmesg` is the classic signature — `operation="dbus_method_call"` shows up only under `ausearch`. Two caveats: (a) Older `ausearch` builds silently skip AppArmor AVCs, because AppArmor logs in the SELinux event range without the `tclass` field ausearch expects (LP#1117804; Ubuntu's `audit` package fixed it in September 2026 for Jammy and Noble). If `ausearch` returns nothing, read `/var/log/audit/audit.log` directly. (b) With **no auditd** running, records fall back to the kernel ring buffer / syslog instead of the audit log — so on a machine without auditd, check `dmesg` and syslog after all.
 
 3. **Reproduction outside the suspected profile.** Run the same command from a fresh login shell, or under `aa-exec --profile=unconfined`. If it still fails, your profile isn't the cause — the block is elsewhere (kernel capability gate, another LSM, a sysctl, a missing setuid helper).
 

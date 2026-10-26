@@ -29,13 +29,13 @@ The unifying problem: **the parent's confinement does not automatically extend, 
 
 When a confined process calls `execve()`, AppArmor consults the parent profile's exec rule for that path and picks one of five transitions. Understanding the difference between them is the single most important thing in multi-process AppArmor work.
 
-| Mode | Letter | What happens to the child's profile | Environment scrubbed? |
-|------|--------|------------------------------------|----------------------|
-| Inherit | `ix` | Same profile as parent | No |
-| Profile | `Px` / `px` | Switch to a top-level profile named after the child binary | `Px` yes, `px` no |
-| Child profile | `Cx` / `cx` | Switch to a profile defined *inside* the parent profile | `Cx` yes, `cx` no |
-| Unconfined | `Ux` / `ux` | No profile at all | `Ux` yes, `ux` no |
-| Named | `Px -> name` / `Cx -> name` | Switch to a specifically-named profile | per uppercase rule |
+- **`ix`** — child keeps the parent's profile.
+- **`Px`** — child switches to a top-level profile attached to its path.
+- **`Cx`** — child switches to a profile declared *inside* the parent.
+- **`Ux`** — child runs unconfined.
+- **`Px -> name` / `Cx -> name`** — child switches to a profile chosen by name.
+
+The full mode table, including lowercase variants and fallbacks (`Pix`, `Cix`, `PUx`, …), is in `rules.md` §2 "Execute transition modes".
 
 **Capital letter = environment scrubbed**: `LD_PRELOAD`, `LD_LIBRARY_PATH`, `TMPDIR`, `IFS`, etc. are stripped before the child sees them. Lowercase keeps them. **Always prefer uppercase** unless you have a specific reason — the lowercase variants exist mainly for legacy compatibility and let an attacker who controls the parent's environment influence the child.
 
@@ -166,7 +166,11 @@ These tools *are* the sandbox: they call `unshare()` to create namespaces and th
 
 **a) The runtime itself is profiled, the inner program is not**
 
-This is the Flatpak model. `bwrap` has an AppArmor profile with `userns,`; the program inside the namespace is unconfined by AppArmor (it's confined by the namespace itself + seccomp + bind mounts). On Ubuntu 24.04 Flatpak shipped `/etc/apparmor.d/bwrap-userns-restrict` exactly for this purpose.
+This is the Flatpak model. `bwrap` has an AppArmor profile with `userns,`; the program inside the namespace is unconfined by AppArmor (it's confined by the namespace itself + seccomp + bind mounts). With the Ubuntu 24.04+ userns restriction, `bwrap` itself needs a profile granting `userns,`, or it fails with `bwrap: setting up uid map: Permission denied`. Where that profile comes from depends on the release:
+
+- Upstream AppArmor ships `bwrap-userns-restrict` as an *extra* profile (source tree `profiles/apparmor/profiles/extras/`), not loaded by default.
+- Ubuntu's `apparmor` package installs it as `/etc/apparmor.d/bwrap-userns-restrict` in newer releases (present in 25.10, absent in 24.04); on anything in between, check with `ls /etc/apparmor.d/bwrap*`.
+- Otherwise, check `/etc/apparmor.d/` for an existing `bwrap` profile, copy the upstream extra, or write a minimal one for `/usr/bin/bwrap` with `userns,`.
 
 **b) Both the runtime and inner program are profiled**
 
@@ -225,7 +229,7 @@ AppArmor handles this with `ix`:
 /usr/bin/sudo  ix,
 ```
 
-`Px` here would *break* the setuid behavior on some configurations because the profile transition runs after the SUID promotion. Use `ix` and let the helper run under the parent's profile, or write a dedicated profile for the helper that explicitly grants `capability setuid setgid`.
+Either way the elevated EUID is still gated by AppArmor: with `ix` the parent's profile must grant the capabilities and files the helper needs (`capability setuid setgid,` and so on), and with `Px` a dedicated helper profile must. A dedicated profile is tighter, because the parent then never holds those capabilities itself.
 
 ### Pattern 5: Service manager spawning workers (systemd-style)
 
@@ -245,7 +249,7 @@ AppArmor offers three ways to scope confinement within a single process lineage.
 
 **Child profiles** are the default tool. Use them whenever there's an `execve` boundary.
 
-**Hats** are mid-execution profile changes — the same process drops privileges by entering a "hat" (subprofile). A web server can `change_hat` into a per-request hat that only allows access to that request's working files. The famous use is Apache's `mod_apparmor`. Hats require the program to know about AppArmor and call `change_hat()` explicitly. Most modern apps don't.
+**Hats** are mid-execution changes the program makes itself with `change_hat()` (Apache `mod_apparmor` is the classic case). Syntax, magic token, and why they are a weak boundary: `abstractions.md` §3.
 
 **Stacking** is the newest and most flexible. Two profiles are intersected — the resulting confinement is the AND of both. Useful when:
 
@@ -258,9 +262,9 @@ Stacking is invoked at runtime via the libapparmor API, not declared inline in p
 
 1. **Forgetting that `Px` requires an existing profile.** If `/etc/apparmor.d/usr.bin.helper` doesn't exist, `Px /usr/bin/helper,` fails the exec entirely. Use `Pix` during development.
 
-2. **Profile name vs binary path mismatch.** AppArmor matches by attachment specification, not profile name. `profile foo /usr/bin/bar { ... }` confines `/usr/bin/bar` (the binary), and the profile is *called* `foo` for use in `Px -> foo,` references.
+2. **Profile name vs binary path mismatch.** The attachment path binds a profile, not its name; see `workflow.md` §2.
 
-3. **Child profile inherits parent's `userns,` — but only if you put it there.** This is not implicit. Each child profile that needs to create namespaces needs its own `userns,` rule.
+3. **Child profiles do not inherit `userns,`.** Each one that creates namespaces needs its own rule; see `rules-advanced.md` §1.
 
 4. **`Cx` without `-> name`.** Without the named target, AppArmor looks for a child profile whose name matches the basename of the executed file. For `/opt/app/myapp`, that's `myapp`. If the parent has `Cx /opt/app/myapp,` and a child profile `profile myapp { ... }` exists inside, this works. Otherwise the exec fails.
 

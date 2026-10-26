@@ -6,12 +6,12 @@
     "name": "yevheniikom"
   },
   "metadata": {
-    "version": "1.1.0"
+    "version": "1.1.1"
   },
   "plugins": [
     {
       "name": "apparmor",
-      "description": "Create, edit, audit, and troubleshoot AppArmor profiles on Linux -- the mandatory access control (MAC) system that confines programs via path-based policies. Trigger on AppArmor, mandatory access control, confining or hardening an app/service, profile rules (file, network, capability, signal, dbus, mount), abstractions, tunables, denial-log analysis, the aa-* tools (aa-genprof, aa-logprof, aa-complain, aa-enforce, aa-status), or apparmor_parser. ALSO trigger for confining or auditing Docker/container/Kubernetes workloads, the docker-default profile, --security-opt apparmor, or container escapes. ALSO trigger for Electron/Chromium apps that fail to launch on Ubuntu 24.04+ with chrome-sandbox, SUID sandbox, userns, or namespace-sandbox errors, or any mention of kernel.apparmor_restrict_unprivileged_userns -- prefer triggering over not.",
+      "description": "Create, edit, audit, and troubleshoot AppArmor profiles on Linux (path-based mandatory access control). Trigger on AppArmor, confining an app or service, profile rules (file, network, capability, signal, dbus, mount), abstractions, tunables, denial-log analysis, the aa-* tools, or apparmor_parser. ALSO trigger for Docker/Kubernetes AppArmor (docker-default, --security-opt apparmor, container escapes) and for Electron/Chromium apps failing to launch on Ubuntu 24.04+ (sandbox/userns errors, kernel.apparmor_restrict_unprivileged_userns) -- prefer triggering over not.",
       "category": "security",
       "author": {
         "name": "yevheniikom"
