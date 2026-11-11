@@ -100,7 +100,9 @@ A profile with `flags=(unconfined)` does **not enforce the rules in its body**. 
 - A `Px` / `Pix` exec-transition rule in an unconfined body does **not** force the transition — exec'd children inherit the unconfined label.
 - A `deny` rule in an unconfined body does **not** block — neither plain `deny` nor `audit deny` next to `flags=(unconfined)` stops e.g. SSH-key reads. (This is a different mechanism from the complain-mode `audit deny` quirk in hardening.md §1: there the profile *does* mediate and plain `deny` still fires; here the profile mediates nothing at all.)
 
-The one rule that *does* take effect is `userns,` — which is exactly why every stock userns-creating profile (`/etc/apparmor.d/flatpak`, the Chromium/Firefox profiles, `unprivileged_userns`) is simply `flags=(unconfined)` + `userns,` and nothing else functional. (AppArmor 4.0 also exposes `flags=(default_allow)` for the same shim purpose; Ubuntu's docs use it interchangeably.)
+The one rule that *does* take effect is `userns,` — which is exactly why every stock userns-creating profile (`/etc/apparmor.d/flatpak`, the Chromium/Firefox profiles, `unprivileged_userns`) is simply `flags=(unconfined)` + `userns,` and nothing else functional.
+
+**`flags=(default_allow)` does not help yet.** `apparmor.d(5)` documents it as default-allow that still honours `deny`, `audit` and exec transitions — exactly the stub-with-denies this section rules out. The parser does not implement that: `profile_mode_packed()` in `parser/profile.h` rewrites it to `unconfined` ("until dominance is fixed use unconfined mode for default_allow") on every branch from 4.0 to master, 4.1 and 5.0 included, as of 2026-10. On parser 4.0.1 a `default_allow` profile and an `unconfined` one compile to byte-identical policy even with `deny` rules in the body, so `default_allow` behaves exactly like `unconfined`, version trap below included. On a newer parser, check before relying on it: load the profile and run `aa-exec -p <name> -- cat /proc/self/attr/current`; `(unconfined)` means the denies do nothing.
 
 **Architectural consequence:** you cannot build a "trampoline with denies" out of an unconfined profile — granting userns freedom via `unconfined` simultaneously discards all rule mediation. If a profile must allow `userns,` *and* enforce policy, the policy has to live in a different profile that the userspace tool transitions into, or rely on the tool's own sandbox primitives (bwrap `--ro-bind`, seccomp, landlock). Verify which label is actually in effect with `cat /proc/self/attr/current` under `aa-exec --profile=<name>` — if a known-denied path is readable, no confinement is happening (see workflow.md §4).
 
@@ -338,9 +340,9 @@ Network rules control socket creation and communication.
 
 `tcp`, `udp`, `icmp`.
 
-### Fine-grained access modes (AF_UNIX, newer kernels)
+### Access lists and address conditions
 
-`create`, `bind`, `listen`, `accept`, `connect`, `shutdown`, `getattr`, `setattr`, `getopt`, `setopt`, `send`, `receive`.
+The `network` rule also takes an access list — `create`, `bind`, `listen`, `accept`, `connect`, `shutdown`, `getattr`, `setattr`, `getopt`, `setopt`, `send`, `receive` (e.g. `network (connect, send) inet stream,`) — and `ip=`/`port=`/`peer=(...)` conditions (`apparmor.d(5)`). Kernel enforcement for non-unix families varies by kernel. For AF_UNIX use the standalone `unix` rule — `rules-advanced.md` §3.
 
 ### Examples
 
@@ -440,7 +442,7 @@ Signal rules mediate `kill(2)`, `sigqueue(3)`, and related calls. Both the sende
 
 Use `set=(sig1 sig2 ...)` to restrict to specific signals. Named signals (without `SIG` prefix, lowercase): `hup`, `int`, `quit`, `ill`, `trap`, `abrt`, `bus`, `fpe`, `kill`, `usr1`, `segv`, `usr2`, `pipe`, `alrm`, `term`, `stkflt`, `chld`, `cont`, `stop`, `tstp`, `ttin`, `ttou`, `urg`, `xcpu`, `xfsz`, `vtalrm`, `prof`, `winch`, `io`, `pwr`, `sys`, `exists`.
 
-Real-time signals: `rtmin+0` through `rtmin+31` (Linux provides 32 RT signals indexed 0..31).
+Real-time signals: `rtmin+0` through `rtmin+32` (the range `apparmor.d(5)` accepts).
 
 ### Examples
 

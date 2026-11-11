@@ -93,7 +93,7 @@ unix (getattr, shutdown) addr=none,
 deny unix bind addr="/var/run/malicious.sock",
 ```
 
-When both a coarse `network unix,` rule and a fine-grained `unix` rule exist, both must permit the operation. Prefer the fine-grained form in modern profiles.
+When the kernel has fine-grained AF_UNIX mediation, the parser maps `network unix,` to `unix,` (and `network unix stream,` to `unix stream,`) — `apparmor.d(5)`, "Interaction of network rules and fine grained unix domain socket rules". From then on they are two allow rules of one class, and allow rules combine: an operation is allowed if **either** permits it. So a leftover `network unix,` silently widens every narrow `unix` rule next to it — drop the coarse rule when tightening. On kernels without fine-grained mediation the mapping runs the other way; see `rules.md` §4 "Never blanket-`deny network,`".
 
 ---
 

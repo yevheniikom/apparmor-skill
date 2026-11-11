@@ -22,7 +22,7 @@ Two facts drive most debugging, so keep them in mind from the start:
 - **references/child-processes.md** -- Exec transitions (`ix`, `Px`, `Cx`, `Ux`, named), child profiles, stacking, and patterns for browsers, sandbox runtimes (bwrap/firejail), CI runners, setuid helpers, service workers. Read whenever the program spawns other programs.
 - **references/electron-chromium.md** -- Electron/Chromium apps: the Ubuntu 24.04+ userns restriction, the minimal `flags=(unconfined)` + `userns,` profile, chrome-sandbox, AppImages, full confinement. Read for any Electron/Chromium app or sandbox launch error.
 - **references/docker.md** -- `docker-default` and what it enforces, `--security-opt apparmor=`, Kubernetes `appArmorProfile`, why MAC overrides granted capabilities, and path-based container-escape classes. Read for any container workload.
-- **references/parser-bugs/** -- One file per version-specific `apparmor_parser` bug. Currently `4.0.0-4.0.1-unconfined-mediation.md` (body rules demote a `flags=(unconfined)` stub to enforce). Read when an unconfined stub runs enforced.
+- **references/parser-bugs/** -- One file per version-specific `apparmor_parser` bug. Currently `4.0.0-4.0.1-unconfined-mediation.md` (body rules demote a `flags=(unconfined)` stub to enforce) and `4.0.1-audit-deny-only-segfault.md` (parser exits 10, no message). Read when an unconfined stub runs enforced or the parser fails silently.
 
 ## Core Workflows
 
@@ -56,7 +56,7 @@ Diagnose in this order before writing or widening any allow:
 3. **Is it AppArmor at all?** Read the record with `sudo ausearch -m AVC,USER_AVC -ts recent`, not `dmesg`: DBus denials (`USER_AVC`) never reach the kernel ring buffer, and a plain `deny` (no `audit`) blocks without logging. Cross-check with strace and a reproduction outside the profile (`references/hardening.md` §4).
 4. Only then treat it as a missing allow: read `operation`, `name`, `requested_mask` from the record and add the narrowest rule (`references/rules.md`), or use `aa-logprof`.
 
-Reload after editing with `sudo apparmor_parser -rK <file>` (`-K` skips the compiled cache, which can serve stale policy -- `references/hardening.md` pitfall 12).
+Reload after editing with `sudo apparmor_parser -r -T -W <file>` (`-T` skips the compiled cache, which can serve stale policy; `-W` refreshes it so the next boot doesn't load the stale copy -- `references/hardening.md` pitfall 12).
 
 ### 4. Profile by workload type
 
@@ -87,9 +87,10 @@ Reload after editing with `sudo apparmor_parser -rK <file>` (`-K` skips the comp
 | Electron app won't launch on Ubuntu 24.04+; or tabs crash | Missing `userns,` (in the parent, or in the renderer child profile) | `electron-chromium.md` |
 | `bwrap: setting up uid map: Permission denied` | `bwrap` needs a profile granting `userns,`; which release ships one varies | `child-processes.md` Pattern 2a |
 | An unconfined stub runs *enforced* after adding a `local/` deny | Parser 4.0.0/4.0.1 bug; the deny would be inert on a fixed parser anyway | `parser-bugs/4.0.0-4.0.1-unconfined-mediation.md` |
-| AppImage profile stopped matching | `/tmp/.mount_*` path changes per run | `electron-chromium.md` AppImages |
+| AppImage profile stopped matching | `/tmp/.mount_*` path changes per run; don't wildcard it (any local user gets userns) | `electron-chromium.md` AppImages |
 | Container with `--cap-add SYS_ADMIN` still can't mount | `docker-default` denies the operation regardless of the cap | `docker.md` §3 |
 | Profile won't compile | Syntax error or missing `tunables/global` | `apparmor_parser -QTK`; `hardening.md` pitfall 9 |
+| `apparmor_parser` exits 10 with no message | A compile worker crashed (10 = `ECHILD`); known trigger: every file rule in a profile is an `audit deny` (seen on a 4.0.1 distro build) | `parser-bugs/4.0.1-audit-deny-only-segfault.md` |
 
 ## Important Notes
 
@@ -101,7 +102,7 @@ Reload after editing with `sudo apparmor_parser -rK <file>` (`-K` skips the comp
 Upstream and distro documentation, for corner cases and version-specific behaviour:
 
 - [`apparmor.d(5)`](https://manpages.ubuntu.com/manpages/noble/man5/apparmor.d.5.html) -- full profile syntax
-- [`apparmor_parser(8)`](https://manpages.ubuntu.com/manpages/noble/man8/apparmor_parser.8.html) -- compile/load flags (`-r`, `-QTK`, `--skip-cache`, `-I`)
+- [`apparmor_parser(8)`](https://manpages.ubuntu.com/manpages/noble/man8/apparmor_parser.8.html) -- compile/load flags (`-r`, `-T`/`-W`, `-QTK`, `-I`)
 - [AppArmor project site](https://apparmor.net/) -- release notes (which version carries a fix), wiki
 - [Ubuntu Server AppArmor guide](https://documentation.ubuntu.com/server/how-to/security/apparmor/) -- distro tooling and the 24.04+ `unprivileged_userns` restriction
 - [roddhjav/apparmor.d](https://github.com/roddhjav/apparmor.d) -- the most complete third-party profile set; reference for namespace-creating tools (bwrap, podman, runc) and `attach_disconnected`/`@{att}`

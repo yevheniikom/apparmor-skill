@@ -22,7 +22,7 @@ deny /etc/secrets/master.key r,  # deny wins for this specific file
 - **Enforce mode**: `deny` blocks access and (by default) does **not** log the denial.
 - **Complain mode**: a plain `deny` rule is **still enforced** — it blocks access even though the rest of the profile is log-and-allow. This is the critical difference from regular allow rules, and the reason a profile in complain mode is *not* a no-op for your security-critical denies.
 
-  **Caveat:** an `audit deny` (with the `audit` qualifier) is downgraded to log-and-allow in complain mode, so it does **not** block -- see §3 pitfall 5.
+  **Caveat:** an `audit deny` (with the `audit` qualifier) is downgraded to log-and-allow in complain mode, so it does **not** block. Neither does a plain `deny` under `flags=(complain,audit)`, or when the request also asks for a permission no rule allows -- see §3 pitfall 5.
 
 ### Deny + Audit
 
@@ -98,7 +98,7 @@ deny /etc/shadow rw,             # Block silently -- no log entry
 
 ### Use cases
 
-- **Development**: Use `flags=(complain,audit)` during profile creation to capture all access patterns.
+- **Development**: Use `flags=(complain,audit)` during profile creation to capture all access patterns. Under it no deny blocks, plain `deny` included (§3 pitfall 5).
 - **Production monitoring**: Add `audit` to sensitive rules only (e.g., `audit /etc/shadow r,`) to avoid log noise.
 - **Security alerting**: Use `audit deny` on known-bad accesses to trigger alerts.
 
@@ -181,7 +181,7 @@ deny /etc/shadow rw,
 audit deny /etc/shadow rw,   # logs, but does NOT block in complain mode
 ```
 
-This `audit deny` downgrade is a long-standing quirk, not the documented behavior (LP#1580369 "deny rules not enforced in complain mode", 2016; a 2020 comment there reports the plain-deny case fixed and the audited case still allowing access) — so it's easy to get burned by it. If you want a sensitive-path deny actively enforced while iterating, drop the `audit` qualifier (plain `deny` *is* enforced in complain) or switch the profile to enforce mode. Treat complain mode as a tool for finding missing *allow* rules, not for verifying *denies*.
+This `audit deny` downgrade is undocumented; it falls out of the kernel code. In `aa_audit_file()` (`security/apparmor/file.c`) a denial whose permissions are *quiet* — a plain `deny` — returns the error before complain mode is consulted. Any other denial, an `audit deny` included, goes to `aa_audit()` (`audit.c`), which in complain mode logs it as `ALLOWED` and returns success. LP#1580369 (2016, still open) shows the same split for the profile-level flag: plain denies enforced in complain, but not under `flags=(complain,audit)`. So it's easy to get burned by it. If you want a sensitive-path deny actively enforced while iterating, drop the `audit` qualifier or switch the profile to enforce mode. A plain `deny` is enforced in complain only under two conditions: the profile doesn't also carry the `audit` flag (`flags=(complain,audit)`, §2, skips the quiet shortcut), and the deny covers every permission of the request that no rule allows — any leftover bit sends the whole request down the complain path, and it is allowed. Treat complain mode as a tool for finding missing *allow* rules, not for verifying *denies*.
 
 ### 6. Missing library paths
 
@@ -215,9 +215,11 @@ Programs link against shared libraries at runtime. Without `m` (mmap PROT_EXEC) 
 # Deny without audit produces NO log messages -- debugging nightmare
 deny /secret/** rw,
 
-# Always use audit deny when troubleshooting
+# Use audit deny when troubleshooting
 audit deny /secret/** rw,
 ```
+
+In complain mode an `audit deny` logs but stops blocking (pitfall 5), so troubleshoot denies with the profile in enforce mode.
 
 ### 9. Forgetting `#include <tunables/global>`
 
@@ -247,23 +249,21 @@ You cannot block "follow this symlink" — resolution happens before rule matchi
 
 ### 12. `apparmor_parser -r` may reload from cache
 
-The parser caches compiled policy at `/var/cache/apparmor/`. `apparmor_parser -r` reads the cached binary if its timestamp is newer than the source file — which during development can mean edits get silently ignored when your text editor preserves mtime (git checkouts, some IDEs, etc.).
+The parser caches compiled policy at `/var/cache/apparmor/`. `apparmor_parser -r` reads the cached binary if its timestamp is newer than the source file, and checks included files the same way, by mtime. So a changed file whose mtime ends up older than the cache is silently ignored: a copy that keeps mtimes (`cp -p`, `rsync -a`, `tar x`, dpkg), `touch -d`, clock skew.
 
 ```bash
-# BAD during dev iteration — may load stale cached policy
+# BAD — may load stale cached policy
 sudo apparmor_parser -r /etc/apparmor.d/usr.bin.myapp
+sudo systemctl reload apparmor   # same: it runs the parser with --write-cache and no -T
 
-# GOOD — bypass cache explicitly
-sudo apparmor_parser -r --skip-cache /etc/apparmor.d/usr.bin.myapp
-# or the short flag:
-sudo apparmor_parser -rK /etc/apparmor.d/usr.bin.myapp
-# or force a full reload of everything:
-sudo systemctl reload apparmor
+# GOOD — compile from source, then refresh the cache
+sudo apparmor_parser -r -T -W /etc/apparmor.d/usr.bin.myapp
 ```
 
 Flags (per `apparmor_parser(8)`):
-- `-K` / `--skip-cache` — disables cache reading *and* writing, implies `-T`.
-- `-T` / `--skip-read-cache` — read from source every time, still write cache.
+- `-T` / `--skip-read-cache` — compile from source, ignoring the cache.
+- `-W` / `--write-cache` — write the compiled result to the cache.
+- `-K` / `--skip-cache` — no cache reading *or* writing, implies `-T`. As a reload it fixes the kernel now but leaves the stale cache file behind, and the next boot loads it (`apparmor.service` runs the same script as `systemctl reload apparmor`). Keep `-K` for runs that should not touch the cache, such as validation with `-QTK`.
 
 ---
 

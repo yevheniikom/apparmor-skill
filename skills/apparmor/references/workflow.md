@@ -39,11 +39,11 @@ aa-enforce /usr/bin/myapp       # 4. Re-enforce after fixing
 ### Management commands
 
 ```bash
-# Reload all profiles
+# Reload all profiles (reads the compiled cache, see hardening.md §3 pitfall 12)
 sudo systemctl reload apparmor.service
 
-# Reload a single profile (-K: skip the compiled cache, see hardening.md §3 pitfall 12)
-sudo apparmor_parser -rK /etc/apparmor.d/usr.bin.myapp
+# Reload a single profile (-T: skip the compiled cache, -W: refresh it; pitfall 12)
+sudo apparmor_parser -r -T -W /etc/apparmor.d/usr.bin.myapp
 
 # Remove (unload) a profile
 sudo apparmor_parser -R /etc/apparmor.d/usr.bin.myapp

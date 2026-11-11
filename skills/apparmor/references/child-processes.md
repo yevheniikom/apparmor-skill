@@ -44,7 +44,7 @@ The full mode table, including lowercase variants and fallbacks (`Pix`, `Cix`, `
 **`ix` (inherit)** — the child runs under the *parent's* profile. Use when:
 
 - The child is a tiny helper and you don't want to maintain a separate profile (`/bin/sh -c "echo done"`)
-- The child is a setuid helper that immediately re-execs (`chrome-sandbox`, `pkexec`)
+- The child is Chromium's `chrome-sandbox` setuid helper, which immediately re-execs (other setuid helpers: Pattern 4)
 - The child is a wrapper script: `/usr/bin/myapp` is a shell stub that execs `/usr/lib/myapp/bin/real`. `ix` keeps both under the same profile, which is usually what you want.
 
 Risk: if the child has a security flaw, the attacker inherits all of the parent's permissions. Don't `ix` to anything that processes untrusted input.
@@ -141,10 +141,10 @@ Required:
 
 - `userns,` in both parent profile and the child profile
 - `Cx -> sandbox` rule on the binary path so the re-exec'd child enters a separate, tighter profile
-- `/dev/shm/**` access in both (POSIX shared memory between processes)
+- Shared memory under `/dev/shm` in both profiles; the names are app-specific
 - Often `signal` rules to allow the parent to deliver SIGTERM/SIGKILL to children
 
-See `electron-chromium.md` for the full template. The general pattern is:
+For Chromium and Electron, the concrete rules (shm names, `uid_map` writes, the child's capabilities) are in the `electron-chromium.md` template. The general pattern is:
 
 ```
 profile parent /opt/app/bin {
@@ -221,15 +221,19 @@ The pattern: the parent has access to secrets (artifacts to upload, signing keys
 
 ### Pattern 4: Setuid helper invoked by an unprivileged process
 
-Examples: `pkexec`, `sudo`, `chrome-sandbox`, `mount.nfs`. The parent execs a setuid binary; the kernel raises EUID; the helper does its thing.
+Examples: `pkexec`, `sudo`, `mount.nfs`. The parent execs a setuid binary; the kernel raises EUID; the helper does its thing — still gated by AppArmor, whose capability and file rules apply to root too.
 
-AppArmor handles this with `ix`:
+Prefer a dedicated helper profile:
 
 ```
-/usr/bin/sudo  ix,
+/usr/bin/sudo  Px,
 ```
 
-Either way the elevated EUID is still gated by AppArmor: with `ix` the parent's profile must grant the capabilities and files the helper needs (`capability setuid setgid,` and so on), and with `Px` a dedicated helper profile must. A dedicated profile is tighter, because the parent then never holds those capabilities itself.
+With `ix` the helper, and every command it runs as root, is policed only by the parent's profile, so that profile must permit everything the root side needs (`capability setuid setgid,`, PAM's `/etc/shadow` read, the target commands). Capability rules only mask what a process already holds, so this gives the unprivileged parent nothing directly — but the parent's profile becomes the root policy for whatever the helper runs. With `Px` that policy lives in a profile scoped to the helper.
+
+`Px` needs a loaded profile attached to the helper's resolved path, or the exec fails; stock policy often has none for `sudo`/`pkexec` (check `/etc/apparmor.d/`), so you write it. Check the target's flags too: a `Px` onto a `flags=(unconfined)` stub is a `Ux` in disguise.
+
+Exception: Chromium's `chrome-sandbox` stays on `ix` — see `electron-chromium.md` "chrome-sandbox SUID helper".
 
 ### Pattern 5: Service manager spawning workers (systemd-style)
 
@@ -282,7 +286,7 @@ Stacking is invoked at runtime via the libapparmor API, not declared inline in p
 
 11. **Exec of `/proc/self/fd/N` matches the *resolved* target, not the `/proc` path.** `/proc/self/fd/N` is a magic symlink; AppArmor (the kernel) resolves symlinks to the real filename *before* mediation, so it never checks an `x` rule on `@{PROC}/self/fd/[0-9]*`. A program that re-execs itself via an fd (some sandbox trampolines do: `exec /proc/self/fd/3 ...`) needs an `x` rule on whatever fd 3 actually points to — find it with `ls -la /proc/<pid>/fd/N` or by intercepting the real argv. Symptom: exit 126 + `Permission denied` on `/proc/self/fd/N`. Note the `owner` trap above compounds this inside sandboxes — use a non-`owner` exec rule on the resolved path. A *pipe* fd (`pipe:[N]`) cannot be `exec`'d at all — that's a kernel limitation, not a missing rule.
 
-12. **Inherited writable FDs need a write rule in the child profile.** Open file descriptors are inherited across `execve` by default, and after a `Px`/`Cx` transition AppArmor mediates each inherited fd against the *child* profile (the `file_inherit` mediation class). If the parent hands the child an inherited stdout pointing at a file (e.g. a harness capturing output to `/tmp/...`) and the child profile lacks write on that path, buffered writes at process shutdown get `EACCES` — surfacing as a late, confusing failure (e.g. a Python interpreter exiting 120) rather than an obvious denial. An anonymous *pipe* has no path, so no path rule matches and piping the output works — which is why `cmd > file` fails under confinement but `cmd | cat` doesn't. Plain `ix` avoids the whole issue because the child runs under the parent's rules. Fix: grant the child write on the inherited target (commonly `/tmp/** rw,` and `/var/tmp/** rw,`); exfil through `/tmp` stays harmless as long as `deny network` and `deny /tmp/** x` are present.
+12. **Inherited writable FDs need a write rule in the child profile.** Open file descriptors are inherited across `execve` by default, and after a `Px`/`Cx` transition AppArmor mediates each inherited fd against the *child* profile (the `file_inherit` mediation class). If the parent hands the child an inherited stdout pointing at a file (e.g. a harness capturing output to `/tmp/...`) and the child profile lacks write on that path, buffered writes at process shutdown get `EACCES` — surfacing as a late, confusing failure (e.g. a Python interpreter exiting 120) rather than an obvious denial. An anonymous *pipe* has no path, so no path rule matches and piping the output works — which is why `cmd > file` fails under confinement but `cmd | cat` doesn't. Plain `ix` avoids the whole issue because the child runs under the parent's rules. Fix: grant the child the fd's open mode (usually just `w`) on the inherited target — the specific file or the harness's own directory (e.g. `/tmp/myharness-*/** w,`) — not a blanket `/tmp/** rw,`. File rules on a socket path also govern connecting to it (`abstractions/X` grants the X server as `/tmp/.X11-unix/* rw,`), so `/tmp/** rw` lets the child reach every socket under `/tmp` (given the AF_UNIX `create` that `abstractions/base` grants): the X server (`/tmp/.X11-unix/X0` — keystrokes, screenshots, input injection) and, before OpenSSH 10.1 moved it under `~/.ssh/agent`, ssh-agent (`/tmp/ssh-*/agent.*`). And `r` reads other programs' temp files.
 
 ## Development workflow for multi-process apps
 
@@ -292,7 +296,7 @@ Stacking is invoked at runtime via the libapparmor API, not declared inline in p
    ```
    Note every distinct binary path and what argv it's invoked with.
 
-2. **Profile the parent in `complain` mode first**, with a placeholder `Px` for each child:
+2. **Profile the parent in `complain` mode first**, with a placeholder complain-mode child profile for each child:
    ```
    /opt/myapp/bin              Cx -> stub,
    profile stub flags=(complain) { include <abstractions/base> }
@@ -301,9 +305,10 @@ Stacking is invoked at runtime via the libapparmor API, not declared inline in p
 
 3. **Tighten one child at a time**. Don't try to enforce-mode the whole tree at once. Pick the leaf processes (no further children of their own), enforce them, work backward to the root.
 
-4. **Use `aa-logprof` per profile**, not globally. Specify the profile to constrain what changes are proposed:
+4. **Review one profile's events at a time.** `aa-logprof` has no profile filter (`-f` names the *log file*, `-d` the profile dir), so scope it by handing it a log that holds only that profile's records (kernel events name it `profile=`, D-Bus events `label=`):
    ```bash
-   sudo aa-logprof -f /var/log/audit/audit.log
+   sudo grep -E ' (profile|label)="myapp//sandbox"' /var/log/audit/audit.log > ~/myapp-sandbox.log   # leading space skips peer_label=
+   sudo aa-logprof -f ~/myapp-sandbox.log
    ```
 
 5. **Watch for "phantom" children**. Many frameworks spawn subprocesses you don't see in `ps` because they exit fast (e.g., `git` running `gpg-agent` to sign a commit). Tools that help:
